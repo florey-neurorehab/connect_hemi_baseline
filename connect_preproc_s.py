@@ -6,9 +6,12 @@ Created on Wed Mar  2 08:59:09 2016
 
 Peter Goodin
 
-This script takes the stroke data from the Connect and Prepare studies and runs 
+This script takes the HEALTHY data from the Connect studies and runs 
 a resting state analysis cleaning and normalisation regime specialised for stroke
 data. 
+
+The only difference between this and the stroke scripts is the removal of FLAIR + mask from
+epi coreg + normalisation. 
 
 v3. 
 *Made seperate mask calcs for WM and CSF. CSF didn't survive after erosion for
@@ -46,45 +49,50 @@ Added new erosion algorithm (scipy.ndimage) - faster than FSL erosion + more
 control on erosion properties. 
 
 Split WM + CSF into two compcor calls with 5 components each (same as CONN toolbox).
-Thresh @ .99 with 2 erosions using a 27 voxel structure element.
+Thresh @ .99 with 2 erosions each (6mm)
 
-Outputs correlation matrices from the AAL and Gordon (2014) atlases for further
+Outputs correlation matrices from the AAL atlas for further
 analysis.
+
+
+v9.1.
+Refactored code of compcor to make less monolithic.
+Added graph lasso regularised AAL outputs.
 """
 
 
 ####Import####
 from __future__ import division
-from nipype.interfaces import fsl, spm, dcmstack, ants, afni
+from nipype.interfaces import spm, dcmstack, ants, afni
 from nipype.interfaces.io import SelectFiles, DataSink
 from nipype.interfaces.utility import IdentityInterface, Function
-from nipype.algorithms import misc
+from nipype.algorithms import confounds
 from nipype.pipeline.engine import Workflow, Node, MapNode
 import os
 import time
 
 
-start=time.time()
+start = time.time()
 #Set up directories and info
 
-rawdir='/home/peter/Desktop/Connect/rest/raw/'
-writedir='/home/peter/Desktop/Connect/rest/'
-workdir=writedir+ 'working/'
-crashdir=writedir+'crash/'
-outdir=writedir+'output/'
+raw_dir='/home/peter/Desktop/Connect/rest/raw/'
+write_dir='/home/peter/Desktop/Connect/rest/'
+work_dir=write_dir+ 'working/'
+crash_dir=write_dir+'crash/'
+out_dir=write_dir+'output/'
 
-os.chdir(crashdir)
+os.chdir(crash_dir)
 
-
-try:
-    os.mkdir(outdir)
-except:
-    print 'Outdir: ' + outdir + ' already exists. Not creating new folder' 
 
 try:
-    os.mkdir(crashdir)
+    os.mkdir(out_dir)
 except:
-    print 'Crashdir: ' + crashdir + ' already exists. Not creating new folder' 
+    print 'out_dir: ' + out_dir + ' already exists. Not creating new folder' 
+
+try:
+    os.mkdir(crash_dir)
+except:
+    print 'crash_dir: ' + crash_dir + ' already exists. Not creating new folder' 
     
 
 
@@ -92,9 +100,9 @@ except:
 ###SETTINGS###
 
 #Smoothing kernal
-fwhm=6
+fwhm = 6
 
-subject_list_raw = os.listdir(rawdir)
+subject_list_raw = os.listdir(raw_dir)
 subject_list = [x for x in subject_list_raw if 'D_S' in x]
 subject_list.sort()
 
@@ -107,56 +115,58 @@ def metaread(nifti):
     Uses dcmstack.lookup to get TR and slice times, and NiftiWrapper to get
     image dimensions (number of slices is the z [2]).
     """
+
     from nipype.interfaces import dcmstack
     from dcmstack.dcmmeta import NiftiWrapper
-    nii=NiftiWrapper.from_filename(nifti)
-    imdims=nii.meta_ext.shape
-    sliceno=imdims[2]
-    lookup=dcmstack.LookupMeta()
-    lookup.inputs.meta_keys={'RepetitionTime':'TR','CsaImage.MosaicRefAcqTimes':'ST'}
-    lookup.inputs.in_file=nifti
+    nii = NiftiWrapper.from_filename(nifti)
+    imdims = nii.meta_ext.shape
+    sliceno = imdims[2]
+    mid_slice = int(sliceno / 2)
+    lookup = dcmstack.LookupMeta()
+    lookup.inputs.meta_keys = {'RepetitionTime':'TR','CsaImage.MosaicRefAcqTimes':'ST'}
+    lookup.inputs.in_file = nifti
     lookup.run()
-    slicetimes=[int(lookup.result['ST'][0][x]) for x in range(0,imdims[2])] #Converts slice times to ints. 
-    tr=lookup.result['TR']/1000 #Converts tr to seconds.
-    ta=tr-(tr/sliceno)
-    return (sliceno, slicetimes, tr, ta)
+    slicetimes = [int(lookup.result['ST'][0][x]) for x in range(0,imdims[2])] #Converts slice times to ints. 
+    tr = lookup.result['TR']/1000 #Converts tr to seconds.
+    ta = tr -(tr / sliceno)
+    return (sliceno, slicetimes, tr, ta, mid_slice)
            
-metadata=Node(Function(function=metaread,input_names=['nifti'],output_names=['sliceno', 'slicetimes', 'tr', 'ta']),name='metadata')
+metadata = Node(Function(function = metaread, input_names = ['nifti'], output_names = ['sliceno', 'slicetimes', 'tr', 'ta', 'mid_slice']), name = 'metadata')
 #Outputs: tr, slicetimes, imdims
 
    
-def voldrop(epilist):
+def voldrop(epi_list):
     """
     Drops volumes > nvols.
     """
     import numpy as np
     import os
-    nvols=140 #<--------See if there's a way to call a variable outside of a function as input for the function
-    vols=len(epilist)
-    if vols>nvols:
-        epilist=epilist[0:nvols]
-    volsdropped=[vols-nvols]
-    print 'Dropped ' + str(volsdropped) + ' volumes.'
-    volsdropped_filename=os.path.join(os.getcwd(),'volsdropped.txt')
-    np.savetxt(volsdropped_filename,volsdropped,fmt="%.5f",delimiter=',')
+    nvols = 140 #<--------See if there's a way to call a variable outside of a function as input for the function (globals)
+    vols = len(epi_list)
+    if vols > nvols:
+        epi_list = epi_list[0: nvols]
+    volsdropped = vols - nvols
+    print('Dropped {} volumes'.format(volsdropped))
+    volsdropped_fn = os.path.join(os.getcwd(), 'volsdropped.txt')
+    np.savetxt(volsdropped_fn, np.atleast_2d(volsdropped))
     
-    return (epilist,volsdropped_filename)         
+    return (epi_list, volsdropped_fn)        
 
-dropvols=Node(Function(function=voldrop,input_names=['epilist'],output_names=['epilist','volsdropped_filename']),name='dropvols')
-#Outputs: epilist 
+dropvols = Node(Function(function = voldrop, input_names = ['epi_list'], output_names = ['epi_list','volsdropped_fn']),name='dropvols')
+#Outputs: epi_list 
 
 def get_mask_files(seg):
     """
     Makes a list  of outputs from the segmentation of the T1 to be passed to
     masking functions
     """
-    wm=seg[1][0]
-    csf=seg[2][0]
+    wm = seg[1][0]
+    csf = seg[2][0]
     return (wm,csf)
 
-mask_list=Node(Function(function=get_mask_files,input_names=['seg'],output_names=['wm','csf']),name='mask_list')
+mask_list = Node(Function(function = get_mask_files, input_names = ['seg'], output_names = ['wm','csf']),name='mask_list')
 
-def make_noise_masks(wm_in,csf_in,mask_in):
+def make_noise_masks(wm_in,csf_in):
     """
     Creates noises masks to be used for compcor. Thresholds and erodes masks by 1 voxel per iteration.
     Note: For stroke participants, the lesion mask is applied to decrease the amount of voxels for erosion.
@@ -168,110 +178,298 @@ def make_noise_masks(wm_in,csf_in,mask_in):
     from scipy.ndimage import binary_erosion as be
     import os
 	
-    csfinfo=nb.load(csf_in)
-    wminfo=nb.load(wm_in)
-    
-    maskdata=nb.load(mask_in).get_data() #Invert image so lesion region is removed from noise masks.
-    maskdata[np.isnan(maskdata)==1]=0
-    invmaskdata=1-maskdata
+    csf_info = nb.load(csf_in)
+    wm_info = nb.load(wm_in)
 
-    csfinfo=nb.load(csf_in)
-    wminfo=nb.load(wm_in)
+    csf_data = csf_info.get_data() > 0.99
+    wm_data = wm_info.get_data() > 0.99
 
-    csfdata=csfinfo.get_data()>0.99
-    wmdata=wminfo.get_data()>0.99
-
-    csfdata[np.isnan(csfdata)==1]=0
-    wmdata[np.isnan(wmdata)==1]=0
-
-    csfdata=csfdata*maskdata
-    wmdata=wmdata*maskdata
-    maskedtissuesdata=wmdata+csfdata
+    csf_data[np.isnan(csf_data) == 1] = 0
+    wm_data[np.isnan(wm_data) == 1] = 0
 
     #Erosion structure
     #s=np.ones([2,2,2])   
-    s=np.ones([3,3,3])
+    s = np.ones([3,3,3])
 
-    csf_erode=be(csfdata,iterations=2,structure=s)
-    wm_erode=be(wmdata,iterations=2,structure=s)
+    csf_erode = be(csf_data, iterations = 2,structure = s)
+    wm_erode = be(wm_data,iterations = 2,structure = s)
     
-    wmimg=nb.Nifti1Image(wm_erode, header=wminfo.get_header(), affine=wminfo.get_affine())
-    csfimg=nb.Nifti1Image(csf_erode, header=csfinfo.get_header(), affine=csfinfo.get_affine())
-    mtimg=nb.Nifti1Image(maskedtissuesdata, header=wminfo.get_header(), affine=wminfo.get_affine())
-    wmmask_file=os.path.join(os.getcwd(),'wm_erode.nii')
-    csfmask_file=os.path.join(os.getcwd(),'csf_erode.nii')
-    mtmask_file=os.path.join(os.getcwd(),'maskedtissues.nii')
-    wmimg.to_filename(wmmask_file)
-    csfimg.to_filename(csfmask_file)
-    mtimg.to_filename(mtmask_file)
+    wm_img = nb.Nifti1Image(wm_erode, header = wm_info.header, affine = wm_info.affine)
+    csf_img = nb.Nifti1Image(csf_erode, header = csf_info.header, affine = csf_info.affine)
+    wm_mask_fn = os.path.join(os.getcwd(), 'wm_erode.nii')
+    csf_mask_fn = os.path.join(os.getcwd(), 'csf_erode.nii')
+    wm_img.to_filename(wm_mask_fn)
+    csf_img.to_filename(csf_mask_fn)
     
-    return(wmmask_file,csfmask_file,mtmask_file)
+    return(wm_mask_fn, csf_mask_fn)
 
-noisemask=Node(Function(function=make_noise_masks,input_names=['wm_in','csf_in','mask_in'],output_names=['wmmask_file','csfmask_file','mtmask_file']),name='noisemask')
+noisemask = Node(Function(function = make_noise_masks, input_names = ['wm_in','csf_in'], output_names=['wm_mask_fn','csf_mask_fn']), name = 'noisemask')
+    
+def get_seg_files(seg, wmnoise, csfnoise):
+    """
+    Makes a list (coreg_list) of outputs from the segmentation of the T1 to be passed to
+    coregistration from T1 to EPI dims. 
+    """
+    seg = [x[0] for x in seg] #unlist items
+    gm = seg[0]
+    wm = seg[1]
+    csf = seg[2]
+    wmnoise = wmnoise
+    csfnoise = csfnoise
+    coreg_list = [gm, wm, csf, wmnoise, csfnoise]
+    return (coreg_list)
 
-def get_flair_2_anat_files(wmnoise,csfnoise,seg,flair,flairmask):
+seg_list = Node(Function(function = get_seg_files, input_names = ['seg','wmnoise','csfnoise'], output_names = ['coreg_list']), name = 'seg_list')
+
+def get_flair_2_anat_files(wmnoise, csfnoise, seg, flair, flairmask):
     """
     Makes a list of outputs from the FLAIR / mask to T1 coregistration 
     and segmented T1 to be passed to the coregistration from T1 to EPI. 
     """
-    gm=seg[0]
-    wm=seg[1]
-    csf=seg[2]
-    flair=flair
-    flairmask=flairmask
-    wmnoise=wmnoise
-    csfnoise=csfnoise
-    coreglist=[gm,wm,csf,flair,flairmask,wmnoise,csfnoise]
-    return (flair,flairmask,coreglist)
+    gm = seg[0]
+    wm = seg[1]
+    csf = seg[2]
+    flair = flair
+    flairmask = flairmask
+    wmnoise = wmnoise
+    csfnoise = csfnoise
+    coreglist = [gm, wm, csf, flair, flairmask, wmnoise, csfnoise]
+    return (gm, wm, csf, flair, flairmask, wmnoise, csfnoise, coreglist)
 
-flair2anat_list=Node(Function(function=get_flair_2_anat_files,input_names=['wmnoise','csfnoise','seg','flair','flairmask'],output_names=['flair','flairmask','coreglist']),name='flair2anat_list')
+flair2anat_list = Node(Function(function = get_flair_2_anat_files, input_names = ['wmnoise','csfnoise','seg','flair','flairmask'], output_names = ['gm', 'wm', 'csf', 'flair', 'flairmask', 'wmnoise', 'csfnoise', 'coreglist']), name = 'flair2anat_list')
 
 
-def get_anat_2_epi_files(coreg_files,source):
+def get_anat_2_epi_files(coreg_source, coreg_files):
     """
     Makes a list of outputs from the T1 to EPI coregistration. 
     """
-    source=source[0]
-    gm=coreg_files[0]
-    wm=coreg_files[1]
-    csf=coreg_files[2]
-    flairmask=coreg_files[4]
-    wmnoise=coreg_files[5]
-    csfnoise=coreg_files[6]
-    return (gm,wm,csf,source,flairmask,wmnoise,csfnoise)
+    gm = coreg_files[0]
+    wm = coreg_files[1]
+    csf = coreg_files[2]
+    flair = coreg_files[3]
+    flairmask = coreg_files[4]
+    wmnoise = coreg_files[5]
+    csfnoise = coreg_files[6]
+    source = coreg_source[0]
+    return (gm, wm, csf, flair, flairmask, wmnoise, csfnoise, source)
 
-anat2epi_list=Node(Function(function=get_anat_2_epi_files,input_names=['coreg_files','source'],output_names=['gm','wm','csf','source','flairmask','wmnoise','csfnoise']),name='anat2epi_list')
-#Outputs: gm, wm, csf, coregistered source image
+anat2epi_list = Node(Function(function = get_anat_2_epi_files, input_names = ['coreg_source', 'coreg_files'], output_names = ['gm', 'wm', 'csf', 'flair', 'flairmask', 'wmnoise', 'csfnoise', 'source']), name = 'anat2epi_list')
+#Outputs: gm, wm, csf, flair, flairmask, wmnoise, csfnoise
 
 
-def calc_mmask(gm,wm,csf):
+def calc_mmask(gm, wm, csf, anat):
     """
     Calculates participant specific brain mask using gm, wm and csf co-registered output.
     """
+    import numpy as np
     import nibabel as nb
     import os
     from scipy.ndimage import binary_fill_holes as bfh    
     
-    gm_mask=nb.load(gm)
-    wm_mask=nb.load(wm)
-    csf_mask=nb.load(csf)
-    m_mask=gm_mask.get_data()+wm_mask.get_data()+csf_mask.get_data()
-    m_mask[m_mask>.1]=1
-    m_mask=bfh(m_mask)
-    brain_ss=gm_mask.get_data()+wm_mask.get_data()
-    img1 = nb.Nifti1Image(m_mask, header=gm_mask.get_header(), affine=gm_mask.get_affine())
-    filename1 = os.path.join(os.getcwd(),'mmask.nii')
-    img1.to_filename(filename1)
-    img2 = nb.Nifti1Image(brain_ss, header=gm_mask.get_header(), affine=gm_mask.get_affine())
-    filename2 = os.path.join(os.getcwd(),'brain_ss.nii')
-    img2.to_filename(filename2)
-    return (filename1,filename2)
+    anat = nb.load(anat).get_data()
 
-mmaskcalc=Node(Function(function=calc_mmask,input_names=['gm','wm','csf'],output_names=['filename1','filename2']),name='m_mask')
+    gm_mask = nb.load(gm).get_data()
+    wm_mask = nb.load(wm).get_data()
+    csf_mask = nb.load(csf).get_data()
+    m_mask = np.sum([gm_mask, wm_mask, csf_mask], axis = 0)
+    m_mask[m_mask > 0.1] = 1
+    m_mask = bfh(m_mask) #Fills holes in mask.
+    
+    #brain_thresh = np.sum([gm_mask, wm_mask], axis = 0) > 0
+    #brain_ss = anat * brain_thresh
+    brain_ss = gm_mask + wm_mask #Produce a binary "skull stripped" image from seg (less issues with lesions)
+    
+    m_mask_img = nb.Nifti1Image(m_mask, header = nb.load(gm).header, affine = nb.load(gm).affine)
+    mmask_fn = os.path.join(os.getcwd(),'mmask.nii')
+    m_mask_img.to_filename(mmask_fn)
+    brain_ss_img = nb.Nifti1Image(brain_ss, header = nb.load(gm).header, affine = nb.load(gm).affine)
+    brain_ss_fn = os.path.join(os.getcwd(),'brain_ss.nii')
+    brain_ss_img.to_filename(brain_ss_fn)
+    return (mmask_fn, brain_ss_fn)
+
+mmask_calc = Node(Function(function = calc_mmask, input_names = ['gm', 'wm', 'csf', 'anat'], output_names = ['mmask_fn', 'brain_ss_fn']), name = 'm_mask')
 #Outputs: binarised "matter" mask
 
 
-def data_clean(epifile,mmaskfile,wmnoisefile,csfnoisefile,motionparams):
+def make_motion_plot(motion_parameters):
+    """
+    Plots realignment parameters
+    """
+    import matplotlib.pylab as plt
+    import numpy as np
+    import os
+
+    motion_plot_fn = os.path.join(os.getcwd(), 'motion_plot.png')
+    motion = np.genfromtxt(motion_parameters)
+    deg_labels = ['x','y','z']
+    rot_labels = ['pitch', 'yaw', 'roll']
+    colour_list = ['r','b','g']
+
+    for n, label in enumerate(deg_labels):
+        plt.subplot(211), plt.plot(motion[:, n], colour_list[n], label = label)
+    plt.legend()
+    plt.xlabel('Volumes')
+    plt.ylabel('Motion (degrees)')
+
+    for n, label in enumerate(rot_labels):
+        plt.subplot(212), plt.plot(motion[:, n + 3], colour_list[n], label = label)
+    plt.legend()
+    plt.xlabel('Volumes')
+    plt.ylabel('Motion (radians)')
+    plt.show()
+
+    return(motion_plot_fn)
+
+motion_plot = Node(Function(function = make_motion_plot, input_names = ['motion_parameters'], output_names = ['motion_plot_fn']), name = 'motion_plot')
+
+
+def make_motion_regressor(motion_params_fn):
+    '''
+    Make the motion 24 regressor for use in compcor
+    Note: motion_params is the output from realignment.
+    '''
+    
+    import numpy as np
+    import os
+    
+    motion = np.genfromtxt(motion_params_fn)
+    
+    #CALCULATE FRISTON 24 MODEL (6 motion params + preceeding vol + each values squared.)
+    motion_squared = motion ** 2
+    new_motion = np.concatenate((motion, motion_squared), axis = 1)
+    motion_roll = np.roll(motion, 1, axis = 0)
+    motion_roll[0] = 0
+    new_motion = np.concatenate((new_motion, motion_roll), axis = 1)
+    motion_roll_squared = motion_roll ** 2
+    motion24 = np.concatenate((new_motion, motion_roll_squared), axis = 1)
+    
+    motion24_fn = os.path.join(os.getcwd(), 'motion24_regs.txt')
+    np.savetxt(motion24_fn, motion24, delimiter = ',')
+    return(motion24_fn)
+
+motion_regressor = Node(Function(function = make_motion_regressor, input_names = ['motion_params_fn'], output_names = ['motion24_fn']), name = 'motion_regressor')
+    
+
+def make_wm_regressor(epi_fn, wm_mask_fn):
+    '''
+    Makes wm noise regressor for use in compcor.
+    '''
+    import nibabel as nb
+    import numpy as np
+    import scipy.signal
+    import os
+    
+    epi_data = nb.load(epi_fn).get_data() #Load epi data
+    wm_mask = nb.load(wm_mask_fn).get_data().astype('bool') #Load noise mask
+    
+    wm_data = epi_data[wm_mask].T #Return 2d matrix of wm vox x time
+    
+    #Remove constant and linear trends from wm
+    wm_con = scipy.signal.detrend(wm_data, axis = 0, type = 'constant')
+    wm_lin = scipy.signal.detrend(wm_con, axis = 0, type = 'linear')
+    
+    #Normalise variance
+    wm_z = (wm_lin - np.mean(wm_lin, axis = 0)) / np.std(wm_lin, axis = 0)
+    
+    #Converts nan values to 0
+    wm_z[np.isnan(wm_z) == 1] = 0    
+    
+    #Remove 0 variance time series
+    wm_orig = wm_z.shape[1]
+    wm_z = wm_z[:,np.std(wm_z,axis = 0) != 0]
+    wm_drop = wm_orig - wm_z.shape[1]
+    print('Dropped {} wm time series'.format(wm_drop))
+    
+    wm_drop_fn = os.path.join(os.getcwd(), 'wm_drop.txt')
+    np.savetxt(wm_drop_fn, np.atleast_2d(wm_drop), fmt = str('%.5f'), delimiter = ',')
+    
+    #Compute SVD
+    print('Calculating SVD decomposition.')
+    [wm_u, wm_s, wm_v] = np.linalg.svd(wm_z)
+    wm_var = (wm_s ** 2 / np.sum(wm_s ** 2)) * 100 #Calculate variance explained by individual eigenvectors from s
+    wm_cumvar = np.cumsum(wm_s ** 2) / np.sum(wm_s ** 2) *100 #Calculate cumulative variance explained by eigenvectors from s
+    
+    wm_var_fn = os.path.join(os.getcwd(), 'wm_var_explain.txt')
+    wm_cumvar_fn = os.path.join(os.getcwd(), 'wm_cumvar_explain.txt')
+    np.savetxt(wm_var_fn, wm_var, fmt = str('%.5f'), delimiter = ',')
+    np.savetxt(wm_cumvar_fn, wm_cumvar, fmt = str('%.5f'), delimiter = ',')
+    print('File written to {}'.format(wm_var_fn))
+    print('File written to {}'.format(wm_cumvar_fn))
+    
+    #Get components of interest
+    nComp = 5 #Number of components
+    wm_comps = wm_u[:,:nComp]
+    
+    #Save wm regressor
+    wm_comps_fn = os.path.join(os.getcwd(), 'wm_regs.txt')
+    np.savetxt(wm_comps_fn, wm_comps, delimiter = ',')
+    
+    return(wm_drop_fn, wm_var_fn, wm_cumvar_fn, wm_comps_fn)
+
+wm_regressor = Node(Function(function = make_wm_regressor, input_names = ['epi_fn', 'wm_mask_fn'], output_names = ['wm_drop_fn', 'wm_var_fn', 'wm_cumvar_fn', 'wm_comps_fn']), name = 'wm_regressor')
+
+        
+def make_csf_regressor(epi_fn, csf_mask_fn):
+    '''
+    Makes csf noise regressor for use in compcor.
+    '''
+    import nibabel as nb
+    import numpy as np
+    import scipy.signal
+    import os
+    
+    epi_data = nb.load(epi_fn).get_data() #Load epi data
+    csf_mask = nb.load(csf_mask_fn).get_data().astype('bool') #Load noise mask
+    
+    csf_data = epi_data[csf_mask].T #Return 2d matrix of csf vox x time
+    
+    #Remove constant and linear trends from csf
+    csf_con = scipy.signal.detrend(csf_data, axis = 0, type = 'constant')
+    csf_lin = scipy.signal.detrend(csf_con, axis = 0, type = 'linear')
+    
+    #Normalise variance
+    csf_z = (csf_lin - np.mean(csf_lin, axis = 0)) / np.std(csf_lin, axis = 0)
+    
+    #Converts nan values to 0
+    csf_z[np.isnan(csf_z) == 1] = 0    
+    
+    #Remove 0 variance time series
+    csf_orig = csf_z.shape[1]
+    csf_z = csf_z[:,np.std(csf_z,axis = 0) != 0]
+    csf_drop = csf_orig - csf_z.shape[1]
+    print('Dropped {} csf time series'.format(csf_drop))
+    
+    csf_drop_fn = os.path.join(os.getcwd(), 'csf_drop.txt')
+    np.savetxt(csf_drop_fn, np.atleast_2d(csf_drop), fmt = str('%.5f'), delimiter = ',')
+    
+    #Compute SVD
+    print('Calculating SVD decomposition.')
+    [csf_u, csf_s, csf_v] = np.linalg.svd(csf_z)
+    csf_var = (csf_s ** 2 / np.sum(csf_s ** 2)) * 100 #Calculate variance explained by individual eigenvectors from s
+    csf_cumvar = np.cumsum(csf_s ** 2) / np.sum(csf_s ** 2) *100 #Calculate cumulative variance explained by eigenvectors from s
+    
+    csf_var_fn = os.path.join(os.getcwd(), 'csf_var_explain.txt')
+    csf_cumvar_fn = os.path.join(os.getcwd(), 'csf_cumvar_explain.txt')
+    np.savetxt(csf_var_fn, csf_var, delimiter = ',')
+    np.savetxt(csf_cumvar_fn, csf_cumvar, delimiter = ',')
+    print('File written to {}'.format(csf_var_fn))
+    print('File written to {}'.format(csf_cumvar_fn))
+    
+    #Get components of interest
+    nComp = 5 #Number of components
+    csf_comps = csf_u[:,:nComp]
+    
+    #Save csf regressor
+    csf_comps_fn = os.path.join(os.getcwd(), 'csf_regs.txt')
+    np.savetxt(csf_comps_fn, csf_comps, delimiter = ',')
+    
+    return(csf_drop_fn, csf_var_fn, csf_cumvar_fn, csf_comps_fn)
+
+csf_regressor = Node(Function(function = make_csf_regressor, input_names = ['epi_fn', 'csf_mask_fn'], output_names = ['csf_drop_fn', 'csf_var_fn', 'csf_cumvar_fn', 'csf_comps_fn']), name = 'csf_regressor')
+ 
+    
+
+def run_compcor(epi_fn, global_mask_fn, wm_noise_fn, csf_noise_fn, motion24_fn):
     """
     Regresses out noise time series using the aCompCor method (Behzadi et al. (2007)
     Seperate WM and CSF components (5 a piece, similar to CONN) are used as the noise signal,
@@ -279,190 +477,105 @@ def data_clean(epifile,mmaskfile,wmnoisefile,csfnoisefile,motionparams):
     Global signal is the mean signal of a whole brain (GM, WM, CSF) mask.
     Output is residuals with global signal NOT removed and global removed.  
     """
+    
     import nibabel as nb
     import numpy as np
+    import scipy.signal    
     import os
-    from scipy.signal import detrend
-    
-    epi=nb.load(epifile) #Needed for header and affine info
-    data=epi.get_data()
-    wm_mask=nb.load(wmnoisefile).get_data()
-    wm_mask[np.isnan(wm_mask)]=0
-    wm_mask=wm_mask>0
-    csf_mask=nb.load(csfnoisefile).get_data()
-    csf_mask[np.isnan(csf_mask)]=0
-    csf_mask=csf_mask>0
-    global_mask=nb.load(mmaskfile).get_data()
-    global_mask[np.isnan(global_mask)]=0
-    global_mask=global_mask>0
-    
-    motion=np.genfromtxt(motionparams)
-    
-    #CALCULATE FRISTON 24 MODEL (6 motion params + preceeding vol + each values squared.)
-    motion_squared = motion ** 2
-    new_motion = np.concatenate((motion, motion_squared), axis=1)
-    motion_roll = np.roll(motion, 1, axis=0)
-    motion_roll[0] = 0
-    new_motion = np.concatenate((new_motion, motion_roll), axis=1)
-    motion_roll_squared = motion_roll ** 2
-    motion24 = np.concatenate((new_motion, motion_roll_squared), axis=1)
-    
-    
-    wm_ts=data[wm_mask].T
-    csf_ts=data[csf_mask].T
-    
-    #Remove constant and linear trends from WM
-    Ycon_wm=detrend(wm_ts, axis=0, type='constant')
-    Ylin_wm=detrend(Ycon_wm, axis=0, type='linear')
-    
-    #Normalise variance
-    Yn_wm=(Ylin_wm-np.mean(Ylin_wm,axis=0))/np.std(Ylin_wm,axis=0)
-    dropped=Yn_wm.shape[1]
-    
-    #Converts nan values to 0
-    Yn_wm[np.isnan(Yn_wm)==1]=0    
-    
-    #Remove 0 variance time series
-    Yn_wm=Yn_wm[:,np.std(Yn_wm,axis=0)!=0]
-    wm_dropts=dropped-Yn_wm.shape[1]
-    print 'Dropped '+ str(wm_dropts)+' WM time series'
-    
-    wmdrop_filename=os.path.join(os.getcwd(),'wm_drop.txt')
-    np.savetxt(wmdrop_filename,[wm_dropts],delimiter=',')
-    
-    #Compute SVD
-    print 'Calculating SVD decomposition.'
-    u_wm,s_wm,v_wm=np.linalg.svd(Yn_wm)
-    var_wm=(s_wm**2/np.sum(s_wm**2))*100
-    cumvar_wm=np.cumsum(s_wm**2)/np.sum(s_wm**2)*100
-    
-    #figure();plot(cumvar);title('Cumulative Variance')
-    var_filename_wm=os.path.join(os.getcwd(),'variance_exp_wm.txt')
-    cumvar_filename_wm=os.path.join(os.getcwd(),'cum_variance_exp_wm.txt')
-    np.savetxt(var_filename_wm,var_wm,delimiter=',')
-    np.savetxt(cumvar_filename_wm,cumvar_wm,delimiter=',')
-    print 'File written to '+var_filename_wm
-    print 'File written to '+cumvar_filename_wm
-    
-    #Get components of interest
-    nComp=5 #Number of components
-    
-    comps_wm=u_wm[:,:nComp]
-    
-    
-    #Remove constant and linear trends from CSF
-    Ycon_csf=detrend(csf_ts, axis=0, type='constant')
-    Ylin_csf=detrend(Ycon_csf, axis=0, type='linear')
-    
-    #Normalise variance
-    Yn_csf=(Ylin_csf-np.mean(Ylin_csf,axis=0))/np.std(Ylin_csf,axis=0)
-    dropped=Yn_csf.shape[1]
-    
-    #Converts nan values to 0
-    Yn_csf[np.isnan(Yn_csf)==1]=0      
-    
-    #Remove 0 variance time series
-    Yn_csf=Yn_csf[:,np.std(Yn_csf,axis=0)!=0]
-    csf_dropts=dropped-Yn_csf.shape[1]
-    print 'Dropped '+ str(csf_dropts)+' CSF time series'
-    
-    csfdrop_filename=os.path.join(os.getcwd(),'csf_drop.txt')
-    np.savetxt(csfdrop_filename,[csf_dropts],delimiter=',')
-    
-    
-    #Compute SVD
-    print 'Calculating SVD decomposition.'
-    u_csf,s_csf,v_csf=np.linalg.svd(Yn_csf)
-    var_csf=(s_csf**2/np.sum(s_csf**2))*100
-    cumvar_csf=np.cumsum(s_csf**2)/np.sum(s_csf**2)*100
-    
-    #figure();plot(cumvar);title('Cumulative Variance')
-    var_filename_csf=os.path.join(os.getcwd(),'variance_exp_csf.txt')
-    cumvar_filename_csf=os.path.join(os.getcwd(),'cum_variance_exp_csf.txt')
-    np.savetxt(var_filename_csf,var_csf,delimiter=',')
-    np.savetxt(cumvar_filename_csf,cumvar_csf,delimiter=',')
-    print 'File written to '+var_filename_csf
-    print 'File written to '+cumvar_filename_csf
-    
-    #Get components of interest
-    nComp=5 #Number of components
-    
-    comps_csf=u_csf[:,:nComp]    
-             
-    X1=[]
-    B1=[]
-    Y1=[]
-    Y_resid1=[]      
-    
-    X1=np.column_stack((comps_wm,comps_csf,motion24)) #Build regressors file
 
-    X1n=(X1-np.mean(X1,axis=0))/np.std(X1,axis=0) #Normalise regressors
-    
-    Y1=data[global_mask].T
-    Y1=detrend(Y1,axis=0,type='linear') #Remove linear trend of TS
 
-    B1=np.linalg.lstsq(X1n,Y1)[0]
-    Y_resid1=Y1-X1n.dot(B1) #Regresses nuisance from data
+    #Load epi
+    epi_info = nb.load(epi_fn)
+    epi_data = epi_info.get_data()
     
-    regsglobal_filename=os.path.join(os.getcwd(),'global_regressors.txt')
-    np.savetxt(regsglobal_filename,X1,fmt="%.5f",delimiter=',')
-    print 'File written to '+regsglobal_filename
+    #Load global mask
+    global_mask = nb.load(global_mask_fn).get_data().astype(bool)
     
-    data[global_mask]=Y_resid1.T
-    data=data*(np.repeat(global_mask[:,:,:,np.newaxis],repeats=np.shape(data)[3],axis=3)) #Zeros everything outside brain mask.
-    img=nb.Nifti1Image(data, header=epi.get_header(), affine=epi.get_affine())
-    file_global=os.path.join(os.getcwd(),'residuals_global.nii')
-    img.to_filename(file_global) 
+    #Load confounds
+    motion24 = np.genfromtxt(motion24_fn, delimiter = ',')
+    wm_noise = np.genfromtxt(wm_noise_fn, delimiter = ',')
+    csf_noise = np.genfromtxt(csf_noise_fn, delimiter = ',')
+
+         
+    X1 = []
+    B1 = []
+    Y1 = []
+    Y_resid1 = []      
+    
+    X1 = np.column_stack((wm_noise, csf_noise, motion24)) #Build regressors file
+    
+    X1n = (X1 - np.mean(X1, axis = 0)) / np.std(X1, axis = 0) #Normalise regressors
+    
+    Y1 = epi_data[global_mask].T
+    Y1 = scipy.signal.detrend(Y1, axis = 0, type = 'linear') #Remove linear trend of TS
+    
+    B1 = np.linalg.lstsq(X1n, Y1)[0]
+    Y_resid1 = Y1 - X1n.dot(B1) #Regresses nuisance from data
+    
+    global_regs_fn = os.path.join(os.getcwd(), 'global_regressors.txt')
+    np.savetxt(global_regs_fn, X1, fmt = str('%.5f'), delimiter=',')
+    print('File written to {}'.format(global_regs_fn))
+    
+    epi_data[global_mask] = Y_resid1.T
+    epi_data = epi_data * (np.repeat(global_mask[:,:,:,np.newaxis],repeats = np.shape(epi_data)[3], axis = 3)) #Creates mask with dims = epi (including time), zeros everything outside brain mask.
+    global_img = nb.Nifti1Image(epi_data, header = epi_info.header, affine = epi_info.affine)
+    global_img_fn = os.path.join(os.getcwd(),'residuals_global.nii')
+    global_img.to_filename(global_img_fn) 
     
     #REMOVING GLOBAL
     
-    global_ts=data[global_mask].T
-    data=epi.get_data() #Reload data
+    epi_data = epi_info.get_data() #Reload data
+    global_ts = epi_data[global_mask].T
     
-    X2=[]
-    B2=[]
-    Y2=[]
-    Y_resid2=[]      
     
-    X2=np.column_stack((comps_wm,comps_csf,motion24,np.mean(global_ts,axis=1))) #Build regressors file
-      
-    X2n=(X2-np.mean(X2,axis=0))/np.std(X2,axis=0) #Voxel wise variance normalise
+    X2 = []
+    B2 = []
+    Y2 = []
+    Y_resid2 = []      
     
-    Y2=data[global_mask].T
-    Y2=detrend(Y1,axis=0,type='linear') #Remove linear trend
+    X2 = np.column_stack((wm_noise, csf_noise, motion24, np.mean(global_ts,axis=1))) #Build regressors file
     
-    B2=np.linalg.lstsq(X2n,Y2)[0]
-    Y_resid2=Y2-X2n.dot(B2) #Regresses nuisance from data
+    X2n = (X2 - np.mean(X2, axis = 0)) / np.std(X2, axis = 0) #Voxel wise variance normalise
     
-    regsnoglobal_filename=os.path.join(os.getcwd(),'noglobal_regressors.txt')
-    np.savetxt(regsnoglobal_filename,X2,fmt="%.5f",delimiter=',')
-    print 'File written to '+regsnoglobal_filename
+    Y2 = epi_data[global_mask].T
+    Y2 = scipy.signal.detrend(Y1, axis = 0, type = 'linear') #Remove linear trend
     
-    data[global_mask]=Y_resid2.T
-    data=data*(np.repeat(global_mask[:,:,:,np.newaxis],repeats=np.shape(data)[3],axis=3)) #Zeros everything outside brain mask.
-    img = nb.Nifti1Image(data, header=epi.get_header(), affine=epi.get_affine())
-    file_noglobal=os.path.join(os.getcwd(),'residuals_noglobal.nii')
-    img.to_filename(file_noglobal)
+    B2 = np.linalg.lstsq(X2n,Y2)[0]
+    Y_resid2 = Y2-X2n.dot(B2) #Regresses nuisance from data
+    
+    noglobal_regs_fn = os.path.join(os.getcwd(), 'noglobal_regressors.txt')
+    np.savetxt(noglobal_regs_fn, X2, fmt = str('%.5f'),delimiter=',')
+    print('File written to {}'.format(noglobal_regs_fn))
+    
+    epi_data[global_mask] = Y_resid2.T
+    epi_data = epi_data * (np.repeat(global_mask[:,:,:,np.newaxis], repeats = np.shape(epi_data)[3],axis=3)) #Creates mask with dims = epi (including time), zeros everything outside brain mask.
+    noglobal_img = nb.Nifti1Image(epi_data, header = epi_info.header, affine = epi_info.affine)
+    noglobal_img_fn = os.path.join(os.getcwd(), 'residuals_noglobal.nii')
+    noglobal_img.to_filename(noglobal_img_fn)
 
-    return(wmdrop_filename,csfdrop_filename,var_filename_wm,cumvar_filename_wm,var_filename_csf,cumvar_filename_csf,file_noglobal,file_global,regsglobal_filename,regsnoglobal_filename)
+    return(global_regs_fn, global_img_fn, noglobal_regs_fn, noglobal_img_fn)
     
-compcor_clean=Node(Function(function=data_clean,input_names=['epifile','mmaskfile','wmnoisefile','csfnoisefile','motionparams'],output_names=['wmdrop_filename','csfdrop_filename','var_filename_wm','cumvar_filename_wm','var_filename_csf','cumvar_filename_csf','file_noglobal','file_global','regsglobal_filename','regsnoglobal_filename']),name='compcor_clean')
+compcor_clean = Node(Function(function = run_compcor, input_names = ['epi_fn', 'global_mask_fn', 'wm_noise_fn', 'csf_noise_fn', 'motion24_fn'], output_names = ['global_regs_fn', 'global_img_fn', 'noglobal_regs_fn', 'noglobal_img_fn']), name = 'compcor_clean')
 
 
-def get_clean_files(file1,file2):
+
+def get_clean_files(global_img_fn, noglobal_img_fn):
 
     """
-    Makes a list of the output files from compcor to pass to other functions.
+    Makes a list of the output files from compcor to pass to mapnodes..
     """
-    clean_global=file1
-    clean_noglobal=file2
-    cleaned=[clean_global, clean_noglobal]
-    return (cleaned)
+    clean_global = global_img_fn
+    clean_noglobal= noglobal_img_fn
+    cleaned = [clean_global, clean_noglobal]
+    return(cleaned)
 
-clean_list=Node(Function(function=get_clean_files,input_names=['file1','file2'],output_names=['cleaned']),name='clean_list')
+clean_list = Node(Function(function = get_clean_files, input_names = ['global_img_fn', 'noglobal_img_fn'], output_names = ['cleaned']), name = 'clean_list')
 
-def bandpass_filter(in_file,brainmask):
+def bandpass_filter(epi_fn, global_mask_fn):
     """Bandpass filter the input files
+    
+    From code in CPAC (https://fcp-indi.github.io/)
+    
 
     Parameters
     ----------
@@ -475,15 +588,18 @@ def bandpass_filter(in_file,brainmask):
     import numpy as np
     import os
     
-    lowpass_freq=0.08
-    highpass_freq=0.01
-    fs=1/3.0
+    lowpass_freq = 0.08
+    highpass_freq = 0.01
+    fs = 1 / 3.0
 
-    img = nb.load(in_file)
-    global_mask=nb.load(brainmask).get_data().astype(bool)
-    timepoints = img.shape[-1]
+    epi_info = nb.load(epi_fn)
+    epi_data = epi_info.get_data()
+    global_mask = nb.load(global_mask_fn).get_data().astype(bool)
+   
+    
+    timepoints = epi_info.shape[-1]
     F = np.zeros((timepoints))
-    lowidx = timepoints/2 + 1
+    lowidx = timepoints / 2 + 1
     if lowpass_freq > 0:
         lowidx = np.round(float(lowpass_freq) / fs * timepoints)
     highidx = 0
@@ -491,21 +607,22 @@ def bandpass_filter(in_file,brainmask):
         highidx = np.round(float(highpass_freq) / fs * timepoints)
     F[highidx:lowidx] = 1
     F = ((F + F[::-1]) > 0).astype(int)
-    data = img.get_data()
-    filter_data=data[global_mask].T
-    if np.all(F == 1):
-        data[global_mask]=filter_data.T
-    else:
-        filter_data = np.real(np.fft.ifftn(np.fft.fftn(filter_data)*F[:,np.newaxis]))
-        data[global_mask]=filter_data.T
-    img_out = nb.Nifti1Image(data, img.get_affine(),img.get_header())
-                             
-    out_file=os.path.join(os.getcwd(),'bp_'+in_file.split('/')[-1])
-    img_out.to_filename(out_file)
-  
-    return (out_file)
+    filter_data = epi_data[global_mask].T
     
-bpfilter=MapNode(Function(function=bandpass_filter,input_names=['in_file','brainmask'],output_names=['out_file']),iterfield='in_file',name='bpfilter')
+    if np.all(F == 1):
+        epi_data[global_mask] = filter_data.T
+    else:
+        filter_data = np.real(np.fft.ifftn(np.fft.fftn(filter_data) * F[:,np.newaxis]))
+        epi_data[global_mask] = filter_data.T
+    
+    
+    filter_img = nb.Nifti1Image(epi_data, epi_info.affine, epi_info.header)                         
+    filter_img_fn = os.path.join(os.getcwd(), 'bp_'+ epi_fn.split('/')[-1])
+    filter_img.to_filename(filter_img_fn)
+  
+    return (filter_img_fn)
+    
+bpfilter = MapNode(Function(function = bandpass_filter, input_names = ['epi_fn','global_mask_fn'], output_names = ['filter_img_fn']), iterfield = 'epi_fn',name = 'bpfilter')
 
 
 def get_ants_files(ants_output):
@@ -513,36 +630,65 @@ def get_ants_files(ants_output):
     """
     Gets output from ANTs to pass to normalising all the things. 
     """
-    trans=[ants_output[0],ants_output[1]]
-    return (trans)
+    trans = [ants_output[0], ants_output[1]]
+    return(trans)
 
-ants_list=Node(Function(function=get_ants_files,input_names=['ants_output'],output_names=['trans']),name='ants_list')
+ants_list = Node(Function(function = get_ants_files, input_names = ['ants_output'], output_names = ['trans']), name = 'ants_list')
 #Outputs: transformation matrix, inverse image
 
-def smoothing_files(list1,list2,list3):
+
+def smoothing_files(list1, list2, list3):
 
     """
     Makes a list of the filtered, non-filtered, global, no-global and non-cleaned files
     for smoothing
     """
-    smoothing_files=list1+list2+[list3]
-    print smoothing_files
+    smoothing_files = list1 + list2 + [list3]
     return (smoothing_files)
 
-smooth_list=Node(Function(function=smoothing_files,input_names=['list1','list2','list3'],output_names=['smoothing_files']),name='smooth_list')
+smooth_list = Node(Function(function = smoothing_files, input_names = ['list1','list2','list3'], output_names = ['smoothing_files']), name = 'smooth_list')
 
-def mmask_files(filename1,filename2):
+def make_mmask_list(mmask_fn, brain_ss_fn):
 
     """
     Makes a list of the filtered, non-filtered, global, no-global and non-cleaned files
     for smoothing
     """
-    mmask_files=[filename1,filename2]
-    print mmask_files
-    return (mmask_files)
+    mmask_files = [mmask_fn, brain_ss_fn]
+    return(mmask_files)
 
-mmask_list=Node(Function(function=mmask_files,input_names=['filename1','filename2'],output_names=['mmask_files']),name='mmask_list')
+mmask_list = Node(Function(function = make_mmask_list, input_names = ['mmask_fn', 'brain_ss_fn'], output_names = ['mmask_files']), name = 'mmask_list')
 
+
+def make_binary_mask(mni_lesion_mask_fn):
+    
+    """
+    Takes the ants MNI lesion mask which has smoothing artifact, 
+    value ranges of 0 - 255 and binarises, using 254 as the threshold.
+    Note: Threshold is based on tightness of mask around lesion region through
+    observation.
+    """
+    
+    import nibabel as nb
+    import os
+    
+    mni_mask_info = nb.load(mni_lesion_mask_fn)
+    mni_mask_data = mni_mask_info.get_data()
+
+    #Standardise to 0 - 1 range (x - min / (max - min)
+    mni_stand = (mni_mask_data - mni_mask_data.min()) / (mni_mask_data.max() - mni_mask_data.min())
+    
+    mni_stand[mni_stand < .95] = 0
+    mni_stand = mni_stand.astype(int)
+    
+    
+    lesion_mask_bin_img = nb.Nifti1Image(mni_stand, header = mni_mask_info.header, affine = mni_mask_info.affine)
+    lesion_mask_bin_fn = os.path.join(os.getcwd(), 'lesion_mask_bin.nii')
+    lesion_mask_bin_img.to_filename(lesion_mask_bin_fn)
+    return(lesion_mask_bin_fn)
+
+lesion_mask_bin = Node(Function(function = make_binary_mask, input_names = ['mni_lesion_mask_fn'], output_names = ['lesion_mask_bin_fn']), name = 'lesion_mask_bin')
+        
 
 def make_aal_corrmat(smoothed_files):
     """
@@ -552,12 +698,13 @@ def make_aal_corrmat(smoothed_files):
     """
     import nibabel as nb
     import numpy as np
+    import sklearn.covariance
     import os
-    aalatlas=nb.load('/home/peter/Desktop/test/templates/aal_pa_3mm.nii').get_data()
+    aalatlas = nb.load('/home/peter/Desktop/test/templates/aal_pa_3mm.nii').get_data()
     
-    glob_data=nb.load([s for s in smoothed_files if "sbp_residuals_global_trans.nii" in s][0]).get_data()
-    noglob_data=nb.load([s for s in smoothed_files if "sbp_residuals_noglobal_trans.nii" in s][0]).get_data()
-    noclean_data=nb.load([s for s in smoothed_files if "sraepi_despike_trans.nii" in s][0]).get_data()
+    glob_data = nb.load([s for s in smoothed_files if "sbp_residuals_global_trans.nii" in s][0]).get_data()
+    noglob_data = nb.load([s for s in smoothed_files if "sbp_residuals_noglobal_trans.nii" in s][0]).get_data()
+    noclean_data = nb.load([s for s in smoothed_files if "sraepi_despike_trans.nii" in s][0]).get_data()
     
     #Pre-allocate regional ts matrix
     aalatlas_ts_glob=np.zeros([glob_data.shape[3],len(np.unique(aalatlas))-1])
@@ -571,32 +718,50 @@ def make_aal_corrmat(smoothed_files):
         aalatlas_ts_noglob[:,x-1]=np.mean(noglob_data[roi].T,axis=1)
         aalatlas_ts_noclean[:,x-1]=np.mean(noclean_data[roi].T,axis=1)
         
-    #Run correlations     
-    glob_corrmat=np.corrcoef(aalatlas_ts_glob.T)
-    noglob_corrmat=np.corrcoef(aalatlas_ts_noglob.T)
-    noclean_corrmat=np.corrcoef(aalatlas_ts_noclean.T)
-    
+    #Produce connectivity matrices     
+    glob_corrmat = np.corrcoef(aalatlas_ts_glob.T)
+    glob_lasso = sklearn.covariance.GraphLassoCV(max_iter = 1000).fit(aalatlas_ts_glob)
+
+    noglob_corrmat = np.corrcoef(aalatlas_ts_noglob.T)
+    noglob_lasso = sklearn.covariance.GraphLassoCV(max_iter = 1000).fit(aalatlas_ts_noglob)    
+
+    noclean_corrmat = np.corrcoef(aalatlas_ts_noclean.T)
+    noclean_lasso = sklearn.covariance.GraphLassoCV(max_iter = 1000).fit(aalatlas_ts_noclean)    
+
     #Save data as csv files.
     #Save global
-    file_global=os.path.join(os.getcwd(),'global_correlation_aal.csv')
-    np.savetxt(file_global,glob_corrmat,fmt="%.5f",delimiter=',')
-    file_global_trans=os.path.join(os.getcwd(),'global_correlation_aal_trans.csv')
-    np.savetxt(file_global_trans,np.arctanh(glob_corrmat),fmt="%.5f",delimiter=',')
+    global_corr_fn = os.path.join(os.getcwd(), 'global_correlation_aal.csv')
+    np.savetxt(global_corr_fn, glob_corrmat, fmt = str('%.5f'), delimiter = ',')
+
+    global_lasso_fn = os.path.join(os.getcwd(),'global_lasso_aal.csv')
+    np.savetxt(global_lasso_fn, glob_lasso.precision_, fmt = str('%.5f'), delimiter = ',')
+
+    global_corr_trans_fn = os.path.join(os.getcwd(), 'global_correlation_aal_trans.csv')
+    np.savetxt(global_corr_trans_fn, np.arctanh(glob_corrmat), fmt = str('%.5f'), delimiter=',')
     
     #Save no global
-    file_noglobal=os.path.join(os.getcwd(),'noglobal_correlation_aal.csv')
-    np.savetxt(file_noglobal,noglob_corrmat,fmt="%.5f",delimiter=',')
-    file_noglobal_trans=os.path.join(os.getcwd(),'noglobal_correlation_aal_trans.csv')
-    np.savetxt(file_noglobal_trans,np.arctanh(noglob_corrmat),fmt="%.5f",delimiter=',')
+    noglobal_corr_fn = os.path.join(os.getcwd(), 'noglobal_correlation_aal.csv')
+    np.savetxt(noglobal_corr_fn, noglob_corrmat, fmt = str('%.5f'), delimiter = ',')
+
+    noglobal_lasso_fn = os.path.join(os.getcwd(),'noglobal_lasso_aal.csv')
+    np.savetxt(noglobal_lasso_fn, noglob_lasso.precision_, fmt = str('%.5f'), delimiter = ',')
+
+    noglobal_corr_trans_fn = os.path.join(os.getcwd(), 'noglobal_correlation_aal_trans.csv')
+    np.savetxt(noglobal_corr_trans_fn, np.arctanh(noglob_corrmat), fmt = str('%.5f'), delimiter=',')
     
     #Save no clean - Baseline
-    file_noclean=os.path.join(os.getcwd(),'noclean_correlation_aal.csv')
-    np.savetxt(file_noclean,noclean_corrmat,fmt="%.5f",delimiter=',')
-    
+    noclean_corr_fn = os.path.join(os.getcwd(),'noclean_correlation_aal.csv')
+    np.savetxt(noclean_corr_fn, noclean_corrmat, fmt = str('%.5f'), delimiter=',')
 
-    return(file_global,file_global_trans,file_noglobal,file_noglobal_trans,file_noclean)
+    noclean_lasso_fn = os.path.join(os.getcwd(),'noclean_lasso_aal.csv')
+    np.savetxt(noclean_lasso_fn, noclean_lasso.precision_, fmt = str('%.5f'), delimiter = ',')
 
-aal_corrmat=Node(Function(function=make_aal_corrmat,input_names=['smoothed_files'],output_names=['file_global','file_global_trans','file_noglobal','file_noglobal_trans','file_noclean']),name='aal_corrmat')
+    noclean_corr_trans_fn = os.path.join(os.getcwd(), 'noclean_correlation_aal_trans.csv')
+    np.savetxt(noclean_corr_trans_fn, np.arctanh(noclean_corrmat), fmt = str('%.5f'), delimiter = ',')   
+
+    return(global_corr_fn, global_lasso_fn, global_corr_trans_fn, noglobal_corr_fn, noglobal_lasso_fn, noglobal_corr_trans_fn, noclean_corr_fn, noclean_lasso_fn, noclean_corr_trans_fn)
+
+aal_corrmat = Node(Function(function = make_aal_corrmat,input_names = ['smoothed_files'], output_names = ['global_corr_fn', 'global_lasso_fn', 'global_corr_trans_fn', 'noglobal_corr_fn', 'noglobal_lasso_fn', 'noglobal_corr_trans_fn', 'noclean_corr_fn', 'noclean_lasso_fn', 'noclean_corr_trans_fn']), name = 'aal_corrmat')
 
 ####Nipype script begins below####
 
@@ -606,14 +771,14 @@ infosource=Node(IdentityInterface(fields=['subject_id']),name='infosource')
 infosource.iterables=('subject_id',subject_list)
 
 #Select files
-template={'anat':rawdir + '{subject_id}/*t1*/*.dcm',
-          'epi':rawdir + '{subject_id}/*RESTING+*/*.dcm',
-          'flair':rawdir + '{subject_id}/flair/*.nii',
-          'mask':rawdir + '{subject_id}/mask/*.nii',
+template={'anat':raw_dir + '{subject_id}/*t1*/*.dcm',
+          'epi':raw_dir + '{subject_id}/*RESTING+*/*.dcm',
+          'flair':raw_dir + '{subject_id}/flair/*.nii',
+          'mask':raw_dir + '{subject_id}/mask/*.nii',
           'mni_template':'/home/peter/Desktop/test/templates/template_3mm_brain.nii'}
 
 selectfiles=Node(SelectFiles(template),name='selectfiles')
-selectfiles.inputs.base_directory=rawdir
+selectfiles.inputs.base_directory=raw_dir
 selectfiles.inputs.sort_files=True
 #Outputs: anat, epi, flair, mask,mni_template
 
@@ -642,15 +807,13 @@ realign.inputs.register_to_mean=False
 realign.inputs.quality=1.0
 #Outputs: realignment_parameters, reliced epi images (motion corrected)
 
-tsnr=Node(misc.TSNR(),name='tsnr')
-tsnr.inputs.regress_poly=2
+tsnr = Node(confounds.TSNR(),name = 'tsnr')
+tsnr.inputs.regress_poly = 2 #Note: This removes linear + constant drifts from the epi time series. Compcor removes from the wm / csf
+tsnr.inputs.mean_file = 'mean.nii'
+tsnr.inputs.stddev_file = 'stdev.nii'
+tsnr.inputs.tsnr_file = 'tsnr.nii'
 #Outputs: detrended_file, mean_file, stddev_file, tsnr_file
 
-#Plot realignment <--- Why not just write custom function to output a single figure (see commented in functions)
-plot_motion=MapNode(fsl.PlotMotionParams(),iterfield='in_file',name='plot_motion')
-plot_motion.inputs.in_source='spm'
-plot_motion.iterables = ('plot_type', ['rotations', 'translations'])
-#Outputs: rotations plot, translations plot
 
 smooth=Node(spm.Smooth(),name='smooth')
 smooth.inputs.fwhm=fwhm
@@ -667,24 +830,24 @@ anat_stack.inputs.out_ext='.nii'
 #Outputs: out_file
 
 #Coregisters FLAIR & mask to T1 (NOTE: settings taken from Clinical Toolbox)
-flaircoreg=Node(spm.Coregister(),name='coreg2anat')
-flaircoreg.inputs.cost_function='nmi'
-flaircoreg.inputs.separation=[4,2]
-flaircoreg.inputs.tolerance=[0.02,0.02,0.02,0.001,0.001,0.001,0.01,0.01,0.01,0.001,0.001,0.001]
-flaircoreg.inputs.fwhm = [7,7]
-flaircoreg.inputs.write_interp=1
-flaircoreg.inputs.write_wrap=[0,0,0]
-flaircoreg.inputs.write_mask=False
+flaircoreg = Node(spm.Coregister(), name = 'coreg2anat')
+flaircoreg.inputs.cost_function = 'nmi'
+flaircoreg.inputs.separation=[4, 2]
+flaircoreg.inputs.tolerance=[0.02, 0.02, 0.02, 0.001, 0.001, 0.001, 0.01, 0.01, 0.01, 0.001, 0.001, 0.001]
+flaircoreg.inputs.fwhm = [7, 7]
+flaircoreg.inputs.write_interp = 1
+flaircoreg.inputs.write_wrap=[0, 0, 0]
+flaircoreg.inputs.write_mask = False
 
 #Coregisters T1, FLAIR + mask to EPI (NOTE: settings taken from Clinical Toolbox)
-coreg=MapNode(spm.Coregister(),iterfield='apply_to_files',name='coreg2epi')
-coreg.inputs.cost_function='nmi'
-coreg.inputs.separation=[4,2]
-coreg.inputs.tolerance=[0.02,0.02,0.02,0.001,0.001,0.001,0.01,0.01,0.01,0.001,0.001,0.001]
-coreg.inputs.fwhm = [7,7]
-coreg.inputs.write_interp=1
-coreg.inputs.write_wrap=[0,0,0]
-coreg.inputs.write_mask=False
+coreg2epi = MapNode(spm.Coregister(), iterfield = 'apply_to_files', name = 'coreg2epi')
+coreg2epi.inputs.cost_function='nmi'
+coreg2epi.inputs.separation=[4,2]
+coreg2epi.inputs.tolerance=[0.02,0.02,0.02,0.001,0.001,0.001,0.01,0.01,0.01,0.001,0.001,0.001]
+coreg2epi.inputs.fwhm = [7,7]
+coreg2epi.inputs.write_interp=1
+coreg2epi.inputs.write_wrap=[0,0,0]
+coreg2epi.inputs.write_mask=False
 #Output: coregistered_files
 
 #Segment anatomical
@@ -692,34 +855,33 @@ seg=Node(spm.NewSegment(),name='segment')
 #Outputs: 
 
 #Warps to MNI space using a 3mm template image
-#Note - The template is warped to subj space (with mask as 
-#cost function region) then the inverse transform (subj space > MNI) is used
+#Note - The template is warped to subj space then the inverse transform (subj space > MNI) is used
 #to warp the data.
-antsnorm=Node(ants.Registration(),name='antsnorm')
-antsnorm.inputs.output_transform_prefix = "new"
-antsnorm.inputs.collapse_output_transforms=True
-antsnorm.inputs.initial_moving_transform_com=True
-antsnorm.inputs.num_threads=1
-antsnorm.inputs.output_inverse_warped_image=True
-antsnorm.inputs.output_warped_image=True
-antsnorm.inputs.sigma_units=['vox']*3
-antsnorm.inputs.transforms=['Rigid', 'Affine', 'SyN']
-antsnorm.inputs.terminal_output='file'
-antsnorm.inputs.winsorize_lower_quantile=0.005
-antsnorm.inputs.winsorize_upper_quantile=0.995
-antsnorm.inputs.convergence_threshold=[1e-06]
-antsnorm.inputs.convergence_window_size=[10]
-antsnorm.inputs.metric=['MI', 'MI', 'CC']
-antsnorm.inputs.metric_weight=[1.0]*3
-antsnorm.inputs.number_of_iterations=[[1000, 500, 250, 100],[1000, 500, 250, 100],[100, 70, 50, 20]]
-antsnorm.inputs.radius_or_number_of_bins=[32, 32, 4]
-antsnorm.inputs.sampling_percentage=[0.25, 0.25, 1]
-antsnorm.inputs.sampling_strategy=['Regular','Regular','None']
-antsnorm.inputs.shrink_factors=[[8, 4, 2, 1]]*3
-antsnorm.inputs.smoothing_sigmas=[[3, 2, 1, 0]]*3
-antsnorm.inputs.transform_parameters=[(0.1,),(0.1,),(0.1, 3.0, 0.0)]
-antsnorm.inputs.use_histogram_matching=True
-antsnorm.inputs.write_composite_transform=True
+antsnorm=Node(ants.Registration(),name = 'antsnorm')
+antsnorm.inputs.output_transform_prefix = 'new'
+antsnorm.inputs.collapse_output_transforms = True
+antsnorm.inputs.initial_moving_transform_com = True
+antsnorm.inputs.num_threads = 1
+antsnorm.inputs.output_inverse_warped_image = True
+antsnorm.inputs.output_warped_image = True
+antsnorm.inputs.sigma_units = ['vox'] * 3
+antsnorm.inputs.transforms = ['Rigid', 'Affine', 'SyN']
+antsnorm.inputs.terminal_output = 'file'
+antsnorm.inputs.winsorize_lower_quantile = 0.005
+antsnorm.inputs.winsorize_upper_quantile = 0.995
+antsnorm.inputs.convergence_threshold = [1e-06]
+antsnorm.inputs.convergence_window_size = [10]
+antsnorm.inputs.metric = ['MI', 'MI', 'CC']
+antsnorm.inputs.metric_weight = [1.0] * 3
+antsnorm.inputs.number_of_iterations = [[1000, 500, 250, 100], [1000, 500, 250, 100], [100, 70, 50, 20]]
+antsnorm.inputs.radius_or_number_of_bins = [32, 32, 4]
+antsnorm.inputs.sampling_percentage = [0.25, 0.25, 1]
+antsnorm.inputs.sampling_strategy = ['Regular','Regular','None']
+antsnorm.inputs.shrink_factors = [[8, 4, 2, 1]] * 3
+antsnorm.inputs.smoothing_sigmas = [[3, 2, 1, 0]] * 3
+antsnorm.inputs.transform_parameters = [(0.1,), (0.1,), (0.1, 3.0, 0.0)]
+antsnorm.inputs.use_histogram_matching = True
+antsnorm.inputs.write_composite_transform = False
 
 #Normalise anatomical
 apply2anat=Node(ants.ApplyTransforms(),name='apply2anat')
@@ -776,100 +938,115 @@ apply2epiNF.inputs.num_threads=1
 apply2epiNF.inputs.terminal_output='file'
 
 #Datasink
-substitutions=('_subject_id_', '')
-sink=Node(DataSink(),name="sink")
-sink.inputs.base_directory=outdir
+substitutions = ('_subject_id_', '')
+sink=Node(DataSink(),name = 'sink')
+sink.inputs.base_directory = out_dir
 sink.inputs.substitutions = substitutions
 
-preproc=Workflow(name='stroke_preproc')
-preproc.base_dir=workdir
+preproc=Workflow(name = 'stroke_preproc')
+preproc.base_dir = work_dir
 
                  ####POPULATE INPUTS, GET DATA, DROP EPI VOLS, GENERAL HOUSEKEEPING###
-preproc.connect([(infosource,selectfiles,[('subject_id','subject_id')]),
-                 (selectfiles,dropvols, [('epi','epilist')]),
-                 (dropvols,epi_stack, [('epilist', 'dicom_files')]),
-                 (epi_stack,metadata, [('out_file', 'nifti')]),
-                 (epi_stack,despike, [('out_file', 'in_file')]),
+preproc.connect([(infosource, selectfiles,[('subject_id','subject_id')]),
+                 (selectfiles, dropvols, [('epi','epi_list')]),
+                 (dropvols, epi_stack, [('epi_list', 'dicom_files')]),
+                 (epi_stack, metadata, [('out_file', 'nifti')]),
+                 (epi_stack, despike, [('out_file', 'in_file')]),
+                 
                  ###HERE BE SLICE TIMING###
-                 (metadata,st_corr, [('sliceno','num_slices'),
-                                     ('slicetimes','slice_order'),
-                                     ('tr','time_repetition'),
-                                     ('ta','time_acquisition')]),
-                 (despike,st_corr, [('out_file', 'in_files')]),             
+                 (metadata, st_corr, [('sliceno', 'num_slices'),
+                                     ('slicetimes', 'slice_order'),
+                                     ('tr', 'time_repetition'),
+                                     ('ta', 'time_acquisition')]),
+                 (despike, st_corr, [('out_file', 'in_files')]),             
+                 
                  ###REALIGNMENT / TSNR / SEGMENTATION###
                  (st_corr,realign, [('timecorrected_files','in_files')]),                 
-                 (realign,plot_motion, [('realignment_parameters', 'in_file')]),
                  (realign,tsnr,[('realigned_files','in_file')]),
                  (selectfiles,anat_stack,[('anat','dicom_files')]),
                  (anat_stack,seg,[('out_file','channel_files')]),
                  
                  ###CREATE MASKS FOR aCOMPCOR###
-                 (seg,mask_list,[('native_class_images','seg')]),
-                 (mask_list,noisemask,[('wm','wm_in'),
+                 (seg, mask_list,[('native_class_images','seg')]),
+                 (mask_list, noisemask,[('wm','wm_in'),
                                        ('csf','csf_in')]),
-                 (flaircoreg,noisemask,[('coregistered_files','mask_in')]),
+                 (flaircoreg, noisemask,[('coregistered_files','mask_in')]),
 
                  ###COREG FLAIR TO T1 START###
-                 (anat_stack,flaircoreg,[('out_file','target')]),
-                 (selectfiles,flaircoreg,[('flair','source')]),
-                 (selectfiles,flaircoreg,[('mask','apply_to_files')]),
+                 (anat_stack, flaircoreg,[('out_file','target')]),
+                 (selectfiles, flaircoreg,[('flair','source')]),
+                 (selectfiles, flaircoreg,[('mask','apply_to_files')]),
 
                  ###MAKE LIST OF DATA FOR FLAIR / T1 COREG TO EPI###
-                 (flaircoreg,flair2anat_list,[('coregistered_source','flair')]),
-                 (flaircoreg,flair2anat_list,[('coregistered_files','flairmask')]),
-                 (noisemask,flair2anat_list,[('wmmask_file','wmnoise'),
-                                             ('csfmask_file','csfnoise')]),
+                 (flaircoreg, flair2anat_list,[('coregistered_source','flair')]),
+                 (flaircoreg, flair2anat_list,[('coregistered_files','flairmask')]),
+                 (noisemask, flair2anat_list,[('wm_mask_fn','wmnoise'),
+                                             ('csf_mask_fn','csfnoise')]),
 
-                 (seg,flair2anat_list,[('native_class_images','seg')]),
+                 (seg, flair2anat_list, [('native_class_images', 'seg')]),
 
                  ###COREG TO EPI STARTS###             
-                 (tsnr,coreg, [('mean_file','target')]),
-                 (anat_stack,coreg,[('out_file','source')]),
-                 (flair2anat_list,coreg,[('coreglist','apply_to_files')]),
+                 (tsnr, coreg2epi, [('mean_file','target')]),
+                 (anat_stack, coreg2epi,[('out_file','source')]),
+                 (flair2anat_list, coreg2epi,[('coreglist','apply_to_files')]),
 
                  ###POPULATE COREG LISTS, MAKE MATTER MASKS
-                 (coreg,anat2epi_list,[('coregistered_files','coreg_files'),
-                                       ('coregistered_source','source')]),
-                 (anat2epi_list,mmaskcalc,[('gm','gm'),
+                 (coreg2epi, anat2epi_list, [('coregistered_files','coreg_files'),
+                                            ('coregistered_source', 'coreg_source')]),
+                 
+                 (anat2epi_list, mmask_calc,[('gm','gm'),
                                            ('wm','wm'),
-                                           ('csf','csf')]),
-                 (mmaskcalc,mmask_list,[('filename1','filename1'),
-                                       ('filename2','filename2')]),
+                                           ('csf','csf'),
+                                           ('source', 'anat')]), 
+
+                 (mmask_calc, mmask_list,[('mmask_fn','mmask_fn'),
+                                       ('brain_ss_fn','brain_ss_fn')]),
 
                  ###CLEANING / FILTERING###
-                 (anat2epi_list,compcor_clean, [('wmnoise','wmnoisefile')]),                 
-                 (anat2epi_list,compcor_clean, [('csfnoise','csfnoisefile')]),
-                 (mmaskcalc,compcor_clean, [('filename1','mmaskfile')]),
-                 (realign,compcor_clean,[('realignment_parameters','motionparams')]),
-                 (realign,compcor_clean,[('realigned_files','epifile')]),
-                 (compcor_clean,clean_list,[('file_global','file1'),
-                                            ('file_noglobal','file2')]),
+                 (realign, motion_regressor, [('realignment_parameters', 'motion_params_fn')]),
+                            
+                 (anat2epi_list, wm_regressor, [('wmnoise', 'wm_mask_fn')]),
+                 (realign, wm_regressor, [('realigned_files', 'epi_fn')]),
                  
-                 (clean_list, bpfilter,[('cleaned','in_file')]),
-                 (mmaskcalc,bpfilter,[('filename1','brainmask')]),
+                 (anat2epi_list, csf_regressor, [('csfnoise','csf_mask_fn')]),
+                 (realign, csf_regressor, [('realigned_files', 'epi_fn')]),
+                 
+                 #Run compcor
+                 (realign, compcor_clean,[('realigned_files','epi_fn')]),
+                 (mmask_calc, compcor_clean, [('mmask_fn','global_mask_fn')]),
+                 (wm_regressor, compcor_clean, [('wm_comps_fn', 'wm_noise_fn')]),
+                 (csf_regressor, compcor_clean, [('csf_comps_fn', 'csf_noise_fn')]),
+                 (motion_regressor, compcor_clean,[('motion24_fn','motion24_fn')]),                 
+                 
+                 (compcor_clean, clean_list, [('global_img_fn','global_img_fn'),
+                                            ('noglobal_img_fn','noglobal_img_fn')]),
+                 
+                 #Filter
+                 (clean_list, bpfilter,[('cleaned','epi_fn')]),
+                 (mmask_calc, bpfilter,[('mmask_fn','global_mask_fn')]),
                  
                  ###COMPUTE TRANSFORM TO MNI###
-                 (mmaskcalc,antsnorm,[('filename2','fixed_image')]),
-                 (selectfiles,antsnorm,[('mni_template','moving_image')]),
-                 (anat2epi_list,antsnorm,[('flairmask','fixed_image_mask')]),
+                 (mmask_calc, antsnorm,[('brain_ss_fn','fixed_image')]),
+                 (selectfiles, antsnorm,[('mni_template','moving_image')]),
+                 (anat2epi_list, antsnorm,[('flairmask','fixed_image_mask')]),
                 
                  ###POPULATE ANTS OUTPUT LIST###
                  (antsnorm, ants_list,[('reverse_transforms','ants_output')]),
                  
                  ###APPLY TRANSFORM TO T1 (test warp quality)###
-                 (anat2epi_list,apply2anat,[('source','input_image')]),
-                 (selectfiles,apply2anat,[('mni_template','reference_image')]),
-                 (ants_list,apply2anat,[('trans','transforms')]),                 
+                 (anat2epi_list, apply2anat,[('source','input_image')]),
+                 (selectfiles, apply2anat,[('mni_template','reference_image')]),
+                 (ants_list, apply2anat,[('trans','transforms')]),                 
                  
                  ###APPLY TRANSFORM TO EPI###
-                 (bpfilter,apply2epi,[('out_file','input_image')]),
-                 (selectfiles,apply2epi,[('mni_template','reference_image')]),
-                 (ants_list,apply2epi,[('trans','transforms')]),
+                 (bpfilter, apply2epi,[('filter_img_fn','input_image')]),
+                 (selectfiles, apply2epi,[('mni_template','reference_image')]),
+                 (ants_list, apply2epi,[('trans','transforms')]),
 
                  ###APPLY TRANSFORM TO EPI NO FILTER###
-                 (clean_list,apply2epiNF,[('cleaned','input_image')]),
-                 (selectfiles,apply2epiNF,[('mni_template','reference_image')]),
-                 (ants_list,apply2epiNF,[('trans','transforms')]),
+                 (clean_list, apply2epiNF,[('cleaned','input_image')]),
+                 (selectfiles, apply2epiNF,[('mni_template','reference_image')]),
+                 (ants_list, apply2epiNF,[('trans','transforms')]),
 
                  ###APPLY TRANSFORM TO EPI NO CLEAN###
                  (realign,apply2epiNC,[('realigned_files','input_image')]),
@@ -880,6 +1057,9 @@ preproc.connect([(infosource,selectfiles,[('subject_id','subject_id')]),
                  (anat2epi_list,apply2lesionmask,[('flairmask','input_image')]),
                  (selectfiles,apply2lesionmask,[('mni_template','reference_image')]),
                  (ants_list,apply2lesionmask,[('trans','transforms')]),
+                 
+                 ###BINARISE MNI LESION MASK###
+                 (apply2lesionmask, lesion_mask_bin, [('output_image', 'mni_lesion_mask_fn')]),
 
                  ###APPLY TRANSFORM MATTER MASK###
                  (mmask_list,apply2mmask,[('mmask_files','input_image')]),
@@ -898,35 +1078,44 @@ preproc.connect([(infosource,selectfiles,[('subject_id','subject_id')]),
                  (smooth,aal_corrmat,[('smoothed_files','smoothed_files')]),
                  
                  ###GRAB OUTPUTS###
-                 (infosource,sink,[('subject_id','container')]),
-                 (infosource,sink,[('subject_id','strip_dir')]),
-                 (dropvols,sink,[('volsdropped_filename','QC.@vols')]),
-                 (smooth,sink,[('smoothed_files','preproc_epis')]),
-                 (realign,sink,[('realignment_parameters','QC')]),
-                 (tsnr,sink,[('stddev_file','QC.@std'),
+                 (infosource, sink,[('subject_id','container')]),
+                 (infosource, sink,[('subject_id','strip_dir')]),
+                 (dropvols, sink,[('volsdropped_fn','QC.@vols')]),
+                 (smooth, sink,[('smoothed_files','preproc_epis')]),
+                 (realign, sink,[('realignment_parameters','QC')]),
+                 (tsnr, sink,[('stddev_file','QC.@std'),
                              ('tsnr_file','QC.@tsnr')]),
-                 (plot_motion,sink,[('out_file','QC.@motion_plot')]),
-                 (apply2anat,sink,[('output_image','mni_warped.@anat')]),
-                 (apply2mmask,sink,[('output_image','mni_warped.@mmask')]),
-                 (apply2lesionmask,sink,[('output_image','mni_warped.@lesionmask')]),
-                 (compcor_clean,sink,[('wmdrop_filename','QC.@wmdrop'),
-                                      ('csfdrop_filename','QC.@csfdrop'),
-                                      ('var_filename_wm','QC.@variance_wm'),
-                                      ('cumvar_filename_wm','QC.@cumvariance_wm'),
-                                      ('var_filename_csf','QC.@variance_csf'),
-                                      ('cumvar_filename_csf','QC.@cumvariance_csf'),
-                                      ('regsglobal_filename','QC.@regsglobal'),
-                                      ('regsnoglobal_filename','QC.@regsnoglobal')]),
+                 (apply2anat, sink,[('output_image','mni_warped.@anat')]),
+                 (apply2mmask, sink,[('output_image','mni_warped.@mmask')]),
+                 (lesion_mask_bin, sink,[('lesion_mask_bin_fn','mni_warped.@lesionmask')]),
+                 (wm_regressor, sink, [('wm_drop_fn','QC.@wm_drop'),
+                                      ('wm_var_fn','QC.@wm_var'),
+                                      ('wm_cumvar_fn','QC.@wm_cumvar')]),
+                                      
+                  (csf_regressor, sink, [('csf_drop_fn','QC.@csf_drop'),
+                                      ('csf_var_fn','QC.@csf_var'),
+                                      ('csf_cumvar_fn','QC.@csf_cumvar')]),
+
+                 (compcor_clean, sink,[('global_regs_fn','QC.@global_regs'),
+                                      ('noglobal_regs_fn','QC.@noglobal_regs')]),
+
                  (antsnorm,sink,[('forward_transforms','transforms.@forwardtrans'),
+                                 ('reverse_transforms','transforms.@reversetrans'),
                                  ('warped_image','transforms.@warped'),
                                  ('inverse_warped_image','transforms.@invwarped')]),
-                 (aal_corrmat,sink,[('file_global','corrmat.@global'),
-                                    ('file_global_trans','corrmat.@global_trans'),
-                                    ('file_noglobal','corrmat.@noglobal'),
-                                    ('file_noglobal_trans','corrmat.@noglobal_trans'),
-                                    ('file_noclean','corrmat.@noclean')]),
 
+
+                 (aal_corrmat,sink,[('global_corr_fn','corrmat.@global'),
+                                    ('global_lasso_fn','lasso.@global'),
+                                    ('global_corr_trans_fn','corrmat.@global_trans'),
+                                    ('noglobal_corr_fn','corrmat.@noglobal'),
+                                    ('noglobal_lasso_fn','lasso.@noglobal'),
+                                    ('noglobal_corr_trans_fn','corrmat.@noglobal_trans'),
+                                    ('noclean_corr_fn','corrmat.@noclean'),
+                                    ('noclean_lasso_fn','lasso.@noclean'),
+                                    ('noclean_corr_trans_fn','corrmat.@noclean_trans')]),
                  ])
+
                  
 preproc.write_graph(graph2use='colored', format='svg', simple_form=False)
 preproc.run(plugin='MultiProc',plugin_args={'n_procs': 3})
